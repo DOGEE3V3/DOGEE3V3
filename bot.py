@@ -194,9 +194,17 @@ class DiscordTelegramSoundBot:
                 CHOOSE_ROLE: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, self.tg_choose_role)
                 ],
-                WAIT_AUDIO: [MessageHandler(filters.AUDIO | filters.VOICE, self.tg_receive_audio)],
+                WAIT_AUDIO: [
+                    MessageHandler(
+                        (filters.AUDIO | filters.VOICE | filters.TEXT) & ~filters.COMMAND,
+                        self.tg_receive_audio,
+                    )
+                ],
             },
-            fallbacks=[CommandHandler("cancel", self.tg_cancel)],
+            fallbacks=[
+                CommandHandler("cancel", self.tg_cancel),
+                MessageHandler(filters.Regex(r"^Назад$"), self.tg_back_to_main_menu),
+            ],
             per_user=True,
         )
         self.telegram_app.add_handler(conv)
@@ -207,6 +215,12 @@ class DiscordTelegramSoundBot:
     def _tg_keyboard(self) -> ReplyKeyboardMarkup:
         return ReplyKeyboardMarkup(
             keyboard=[[KeyboardButton("Роль"), KeyboardButton("Звук")]],
+            resize_keyboard=True,
+        )
+
+    def _tg_back_keyboard(self) -> ReplyKeyboardMarkup:
+        return ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton("Назад")]],
             resize_keyboard=True,
         )
 
@@ -256,31 +270,58 @@ class DiscordTelegramSoundBot:
 
         lines = [f"{role.id} — {role.name}" for role in guild.roles if role.name != "@everyone"]
         await update.message.reply_text(
-            "Отправьте ID роли, к которой привязать звук:\n" + "\n".join(lines)
+            "Отправьте ID роли, к которой привязать звук, или нажмите «Назад»:\n"
+            + "\n".join(lines),
+            reply_markup=self._tg_back_keyboard(),
         )
         return CHOOSE_ROLE
 
+    async def tg_back_to_main_menu(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> int:
+        context.user_data.pop("selected_role_id", None)
+        context.user_data.pop("selected_role_name", None)
+        await update.message.reply_text(
+            "Возвращаю в главное меню. Выберите: Роль или Звук.",
+            reply_markup=self._tg_keyboard(),
+        )
+        return ConversationHandler.END
+
     async def tg_choose_role(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         text = (update.message.text or "").strip()
+        if text == "Назад":
+            return await self.tg_back_to_main_menu(update, context)
+
         if not text.isdigit():
-            await update.message.reply_text("Нужен числовой ID роли. Попробуйте снова.")
+            await update.message.reply_text(
+                "Нужен числовой ID роли. Попробуйте снова или нажмите «Назад».",
+                reply_markup=self._tg_back_keyboard(),
+            )
             return CHOOSE_ROLE
 
         role_id = int(text)
         guild = self.discord_bot.get_guild(self.config.guild_id)
         role = guild.get_role(role_id) if guild else None
         if role is None:
-            await update.message.reply_text("Роль не найдена. Введите корректный ID.")
+            await update.message.reply_text(
+                "Роль не найдена. Введите корректный ID или нажмите «Назад».",
+                reply_markup=self._tg_back_keyboard(),
+            )
             return CHOOSE_ROLE
 
         context.user_data["selected_role_id"] = role.id
         context.user_data["selected_role_name"] = role.name
         await update.message.reply_text(
-            f"Роль выбрана: {role.name}. Теперь отправьте аудиофайл или voice-сообщение."
+            f"Роль выбрана: {role.name}. Теперь отправьте аудиофайл или voice-сообщение, либо нажмите «Назад».",
+            reply_markup=self._tg_back_keyboard(),
         )
         return WAIT_AUDIO
 
     async def tg_receive_audio(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        text = (update.message.text or "").strip()
+        if text == "Назад":
+            return await self.tg_back_to_main_menu(update, context)
+
         role_id = context.user_data.get("selected_role_id")
         role_name = context.user_data.get("selected_role_name")
         if not role_id:
