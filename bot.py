@@ -113,6 +113,14 @@ class Storage:
         )
         return list(cur.fetchall())
 
+    def delete_role_sound(self, role_id: int) -> bool:
+        cur = self.conn.execute(
+            "DELETE FROM role_sounds WHERE role_id = ?",
+            (role_id,),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
 
 class DiscordTelegramSoundBot:
     def __init__(self, config: Config):
@@ -190,6 +198,7 @@ class DiscordTelegramSoundBot:
         conv = ConversationHandler(
             entry_points=[
                 MessageHandler(filters.Regex(r"^Роль$"), self.tg_role_list),
+                MessageHandler(filters.Regex(r"^Убрать звук$"), self.tg_remove_sound_entry),
             ],
             states={
                 CHOOSE_ROLE: [
@@ -215,7 +224,7 @@ class DiscordTelegramSoundBot:
 
     def _tg_keyboard(self) -> ReplyKeyboardMarkup:
         return ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton("Роль")]],
+            keyboard=[[KeyboardButton("Роль"), KeyboardButton("Убрать звук")]],
             resize_keyboard=True,
         )
 
@@ -241,14 +250,14 @@ class DiscordTelegramSoundBot:
             await update.message.reply_text("Доступ запрещен.")
             return
         await update.message.reply_text(
-            "Привет! Нажмите «Роль», выберите роль кнопкой и загрузите звук.",
+            "Привет! Нажмите «Роль» чтобы назначить звук, или «Убрать звук» чтобы удалить звук роли.",
             reply_markup=self._tg_keyboard(),
         )
 
     async def tg_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(
-            "1. Роль — выбрать роль сервера кнопкой.\n"
-            "2. После выбора роли отправьте аудиофайл или voice.",
+            "1. Роль — выбрать роль сервера кнопкой и отправить звук.\n"
+            "2. Убрать звук — выбрать роль кнопкой и удалить звук.",
             reply_markup=self._tg_keyboard(),
         )
 
@@ -262,8 +271,26 @@ class DiscordTelegramSoundBot:
             await update.message.reply_text("Discord-бот не подключен к серверу.")
             return ConversationHandler.END
 
+        context.user_data["mode"] = "set_sound"
         await update.message.reply_text(
             "Выберите роль кнопкой ниже, затем отправьте звук для этой роли.",
+            reply_markup=self._tg_role_keyboard(guild),
+        )
+        return CHOOSE_ROLE
+
+    async def tg_remove_sound_entry(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        if update.effective_user is None or not self._tg_is_admin(update.effective_user.id):
+            await update.message.reply_text("Доступ запрещен.")
+            return ConversationHandler.END
+
+        guild = self.discord_bot.get_guild(self.config.guild_id)
+        if guild is None:
+            await update.message.reply_text("Discord-бот не подключен к серверу.")
+            return ConversationHandler.END
+
+        context.user_data["mode"] = "remove_sound"
+        await update.message.reply_text(
+            "Выберите роль кнопкой ниже, чтобы убрать у неё звук.",
             reply_markup=self._tg_role_keyboard(guild),
         )
         return CHOOSE_ROLE
@@ -273,14 +300,16 @@ class DiscordTelegramSoundBot:
     ) -> int:
         context.user_data.pop("selected_role_id", None)
         context.user_data.pop("selected_role_name", None)
+        context.user_data.pop("mode", None)
         await update.message.reply_text(
-            "Возвращаю в главное меню. Выберите: Роль.",
+            "Возвращаю в главное меню. Выберите: Роль или Убрать звук.",
             reply_markup=self._tg_keyboard(),
         )
         return ConversationHandler.END
 
     async def tg_choose_role(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         text = (update.message.text or "").strip()
+        mode = context.user_data.get("mode", "set_sound")
         if text == "Назад":
             return await self.tg_back_to_main_menu(update, context)
 
@@ -310,6 +339,9 @@ class DiscordTelegramSoundBot:
             )
             return CHOOSE_ROLE
 
+        if mode == "remove_sound":
+            return await self.tg_remove_role_sound(update, context, role.id, role.name)
+
         context.user_data["selected_role_id"] = role.id
         context.user_data["selected_role_name"] = role.name
         await update.message.reply_text(
@@ -317,6 +349,37 @@ class DiscordTelegramSoundBot:
             reply_markup=self._tg_back_keyboard(),
         )
         return WAIT_AUDIO
+
+    async def tg_remove_role_sound(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        role_id: int,
+        role_name: str,
+    ) -> int:
+        path = self.storage.get_role_sound(role_id)
+        removed = self.storage.delete_role_sound(role_id)
+
+        if removed and path:
+            file_path = Path(path)
+            if file_path.exists():
+                file_path.unlink()
+
+        if removed:
+            await update.message.reply_text(
+                f"С роли {role_name} удален звук.",
+                reply_markup=self._tg_keyboard(),
+            )
+        else:
+            await update.message.reply_text(
+                f"Для роли {role_name} звук не найден.",
+                reply_markup=self._tg_keyboard(),
+            )
+
+        context.user_data.pop("mode", None)
+        context.user_data.pop("selected_role_id", None)
+        context.user_data.pop("selected_role_name", None)
+        return ConversationHandler.END
 
     async def tg_receive_audio(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         text = (update.message.text or "").strip()
@@ -348,6 +411,9 @@ class DiscordTelegramSoundBot:
             f"Сохранено: роль {role_name} -> {target}",
             reply_markup=self._tg_keyboard(),
         )
+        context.user_data.pop("mode", None)
+        context.user_data.pop("selected_role_id", None)
+        context.user_data.pop("selected_role_name", None)
         return ConversationHandler.END
 
     async def tg_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
